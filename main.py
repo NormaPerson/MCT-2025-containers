@@ -1,40 +1,129 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse
 import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
 import time
 
 app = FastAPI()
 
-DB_CONFIG = {
-    "dbname": "visits_db",
-    "user": "user", 
-    "password": "password",
-    "host": "db",
-    "port": "5432"
-}
+# Параметры подключения к БД из переменных окружения
+DB_HOST = os.getenv("DB_HOST", "db")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("POSTGRES_DB", "app_db")
+DB_USER = os.getenv("POSTGRES_USER", "app_user")
+DB_PASS = os.getenv("POSTGRES_PASSWORD", "app_password")
 
 def get_db_connection():
-    return psycopg2.connect(**DB_CONFIG)
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS,
+        cursor_factory=RealDictCursor
+    )
 
-@app.get("/ping", response_class=PlainTextResponse)
+def init_db():
+    max_retries = 5
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS visits (
+                    id SERIAL PRIMARY KEY,
+                    ip VARCHAR(45) NOT NULL,
+                    user_agent TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+            print("✅ Database initialized successfully")
+            return
+        except Exception as e:
+            print(f"⚠️ Database connection attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                print(f"🔄 Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print("❌ All database connection attempts failed")
+                raise
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the web server with PostgreSQL"}
+
+@app.get("/ping")
 async def ping(request: Request):
     client_ip = request.client.host
+    user_agent = request.headers.get("user-agent", "")
     
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO visits (ip) VALUES (%s)", (client_ip,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return "pong\n"
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO visits (ip, user_agent) VALUES (%s, %s)",
+            (client_ip, user_agent)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return "pong"
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/visits", response_class=PlainTextResponse)
+@app.get("/visits")
 async def get_visits():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM visits")
-    count = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-    return f"Visits: {count}\n"
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) as count FROM visits")
+        result = cur.fetchone()
+        count = result["count"] if result else 0
+        cur.close()
+        conn.close()
+        return {"total_visits": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/visits/details")
+async def get_visits_details():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT ip, user_agent, created_at FROM visits ORDER BY created_at DESC")
+        visits = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {
+            "total_visits": len(visits),
+            "visits": visits
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/health")
+async def health():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.close()
+        db_status = "healthy"
+    except Exception as e:
+        db_status = f"unhealthy: {str(e)}"
+    
+    return {
+        "status": "healthy",
+        "database": db_status,
+        "timestamp": time.time()
+    }
